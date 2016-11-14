@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <time.h>
 
 typedef struct __node_t {
   char* src;
@@ -26,6 +27,7 @@ typedef struct __queue_t {
   char const * name;
   char const * err_msg;
   size_t panic_on_error;
+  struct timespec timeout;
 } queue_t;
 
 int Queue_Init(queue_t *q, size_t size, size_t panic_on_error);

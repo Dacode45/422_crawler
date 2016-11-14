@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <pthread.h>
 #include <regex.h>
+#include <errno.h>
 
 #include "crawler.h"
 
@@ -77,14 +78,18 @@ int crawl(char *start_url,
 
   queue_t link_q;
   link_q.name = "links";
+  link_q.timeout.tv_nsec = 5000000; // 5 ms timeout
   queue_t content_q;
   content_q.name = "content";
+  content_q.timeout.tv_nsec = 5000000; // 5 ms timeout
   queue_t finished_q;
   finished_q.name = "finished";
+  finished_q.timeout.tv_nsec = 0;
+
 
   Queue_Init(&link_q, queue_size, 1);
   Queue_Init(&content_q, queue_size, 1);
-  Queue_Init(&finished_q, (download_workers + parse_workers), 1);
+  Queue_Init(&finished_q, 0, 1);
 
   node_t *first_link_node = (node_t*)malloc(sizeof(node_t));
   first_link_node->src = NULL;
@@ -115,38 +120,38 @@ int crawl(char *start_url,
   // spawn threads parsers first;
   int i = 0;
   for (; i < parse_workers; i++ ) {
-    crawler_arg args = crawler_args[i];
+    crawler_arg *args = &crawler_args[i];
     node_t* retv = &retvs[i];
 
     // src of retv is index of thread. content is return value.
     retv->src = (char *)(long)i;
-    args.link_q = &link_q;
-    args.content_q = &content_q;
-    args.finished_q = &finished_q;
-    args.seen_links = &seen_links;
-    args.retv = retv;
-    args.fetch_fn = _fetch_fn;
-    args.edge_fn = _edge_fn;
+    args->link_q = &link_q;
+    args->content_q = &content_q;
+    args->finished_q = &finished_q;
+    args->seen_links = &seen_links;
+    args->retv = retv;
+    args->fetch_fn = _fetch_fn;
+    args->edge_fn = _edge_fn;
 
-    pthread_create(&parsers[i], NULL, parser, &args);
+    pthread_create(&parsers[i], NULL, parser, args);
     finished[i] = 1;
   }
   if (!should_cancel) {
     for (i = parse_workers; i < (parse_workers + download_workers); i++) {
-      crawler_arg args = crawler_args[i];
+      crawler_arg *args = &crawler_args[i];
       node_t* retv = &retvs[i];
 
       // src of retv is index of thread. content is return value.
       retv->src = (char *)(long)i;
-      args.link_q = &link_q;
-      args.content_q = &content_q;
-      args.finished_q = &finished_q;
-      args.seen_links = &seen_links;
-      args.retv = retv;
-      args.fetch_fn = _fetch_fn;
-      args.edge_fn = _edge_fn;
+      args->link_q = &link_q;
+      args->content_q = &content_q;
+      args->finished_q = &finished_q;
+      args->seen_links = &seen_links;
+      args->retv = retv;
+      args->fetch_fn = _fetch_fn;
+      args->edge_fn = _edge_fn;
 
-      pthread_create(&downloaders[i-parse_workers], NULL, downloader, &args);
+      pthread_create(&downloaders[i-parse_workers], NULL, downloader, args);
       finished[i] = 1;
     }
   }
@@ -155,6 +160,7 @@ int crawl(char *start_url,
     for (i = 0; i < (parse_workers + download_workers); i++) {
       node_t* retv[1];
       Queue_Dequeue(&finished_q, retv);
+
       int thr_index = (int)(long)retv[0]->src;
       should_cancel = (int)(long)retv[0]->content;
       if (thr_index < parse_workers) {
@@ -181,6 +187,9 @@ int crawl(char *start_url,
         }
       }
     }
+  }
+  if (should_cancel) {
+    has_err = -1;
   }
 
   // cleanup.
@@ -234,8 +243,14 @@ void *downloader(void *raw_arg) {
     sem_post(&links_fetching);
     if (link_q_size) {
       // get a link
+      debugf("downloader %p dequeuing %d\n", arg->retv->src, link_q_size);
       Queue_Dequeue(arg->link_q, current_link);
+      debugf("downloader %p dequeued\n", arg->retv->src);
       // get content
+      if (current_link[0] == NULL) {
+        sem_wait(&links_fetching);
+        continue;
+      }
       current_content = arg->fetch_fn((current_link[0])->content);
       if (current_content != NULL) {
         node_t *tmp = (node_t*)malloc(sizeof(node_t));
@@ -294,8 +309,14 @@ void *parser(void *raw_arg) {
     sem_post(&contents_parsing);
     if (content_q_size) {
       // get a link
+      debugf("parser %p dequeuing %d\n", arg->retv->src, content_q_size);
       Queue_Dequeue(arg->content_q, current_content);
+      debugf("parser %p dequeued\n", arg->retv->src);
       // Parse content
+      if (current_content[0] == NULL) {
+        sem_wait(&contents_parsing);
+        continue;
+      }
       first_link = ParseLinks(current_content[0]);
       // Store link
       Node_Free(current_content[0]);
@@ -399,30 +420,43 @@ int Queue_Init(queue_t *q, size_t size, size_t panic_on_error){
 int Queue_Enqueue(queue_t *q, node_t *node) {
   node->next = NULL;
   sem_wait(&q->empty);
-  debugf("Queueu %s End Enqueueing\n", q->name);
-  Queue_Print(q);
+  debugf("Queueu %s Start Enqueueing\n", q->name);
   pthread_mutex_lock(&q->lock);
   if(q->tail != NULL) {
     q->tail->next = node;
+    q->tail = q->tail->next;
   } else {
     q->head = q->tail = node;
   }
+  Queue_Print(q);
+  sem_post(&q->full);
   pthread_mutex_unlock(&q->lock);
   debugf("Queue %s End Enqueue\n", q->name);
-  sem_post(&q->full);
   return 0;
 }
 
 int Queue_Dequeue(queue_t *q, node_t **node) {
-  sem_wait(&q->full);
+  if (q->timeout.tv_nsec == 0) {
+    debugf("Queue %s has %lu timeout\n", q->name, q->timeout.tv_nsec);
+    sem_wait(&q->full);
+  } else {
+    int timedout = sem_timedwait(&q->full, &q->timeout);
+    if (timedout) {
+      debugf("Queue %s had error waiting on full %i. Timeout should be %i\n", q->name, timedout, ETIMEDOUT);
+      node[0] = NULL;
+      return 0;
+    }
+  }
   debugf("Queueu %s Start Dequeueing\n", q->name);
-  Queue_Print(q);
   pthread_mutex_lock(&q->lock);
   if (q->head == NULL) {
     q->head = q->tail;
-  } if (q->head == NULL) {
+  }
+  if (q->head == NULL) {
     perror("queue dequeued when empty");
+    sem_post(&q->full);
     pthread_mutex_unlock(&q->lock);
+    node[0] = NULL;
     return -1;
   }
   node_t *tmp = q->head;
@@ -431,18 +465,19 @@ int Queue_Dequeue(queue_t *q, node_t **node) {
     q->head = q->tail = NULL;
   }
   node[0] = tmp;
-  pthread_mutex_unlock(&q->lock);
   sem_post(&q->empty);
+  Queue_Print(q);
+  pthread_mutex_unlock(&q->lock);
   debugf("Queue %s End Dequeue\n", q->name);
   return 0;
 }
 
 void Queue_Print(queue_t *q) {
   #ifdef DEBUG
-  debugf("Printing contetns of q %s\n", q->name);
+  printf("Printing contetns of q %s\n", q->name);
   node_t *node = q->head;
   while (node != NULL) {
-    debugf("\tprinting NODE: %p\n", node);
+    printf("\tprinting NODE: %p\n", node);
     node = node->next;
   }
   #endif
